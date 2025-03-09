@@ -1416,6 +1416,8 @@ pub fn parse_args(args: &[String]) -> Result<Conf> {
         || conf.mode == RunMode::Prepend
         || conf.mode == RunMode::Postpone;
 
+    let add_mode = conf.mode == RunMode::Add;
+
     if conf.use_editor && conf.mode != RunMode::Edit {
         eprintln!("Option '--interactive' can be used only with `edit` command");
         exit(1);
@@ -1469,9 +1471,13 @@ pub fn parse_args(args: &[String]) -> Result<Conf> {
         }
     }
 
+    // Add mode has no filters, arguments to all other modes start
+    // with selectors.
+    let mut filter = !add_mode;
+
     while idx < matches.free.len() {
         let raw_arg = &matches.free[idx];
-        process_single_free_arg(&mut conf, soon_days, edit_mode, raw_arg);
+        process_single_free_arg(&mut conf, soon_days, edit_mode, &mut filter, raw_arg);
         idx += 1;
     }
 
@@ -1480,7 +1486,8 @@ pub fn parse_args(args: &[String]) -> Result<Conf> {
         let stdin = io::stdin();
         let stdin = stdin.lock();
         BufReader::new(stdin).lines().filter(Result::is_ok).map(Result::unwrap).for_each(|s| {
-            s.split_whitespace().for_each(|arg| process_single_free_arg(&mut conf, soon_days, edit_mode, &arg))
+            s.split_whitespace()
+                .for_each(|arg| process_single_free_arg(&mut conf, soon_days, edit_mode, &mut filter, &arg))
         });
     }
 
@@ -1488,22 +1495,33 @@ pub fn parse_args(args: &[String]) -> Result<Conf> {
     Ok(conf)
 }
 
-fn process_single_free_arg(conf: &mut Conf, soon_days: u8, edit_mode: bool, raw_arg: &str) {
+fn process_single_free_arg(conf: &mut Conf, soon_days: u8, edit_mode: bool, filter: &mut bool, raw_arg: &str) {
     let arg = raw_arg.trim_start();
     let has_space = arg.contains(' ');
-    if arg.starts_with('@') && !has_space {
+
+    // Neither contexts nor projects allow spaces
+    if has_space {
+        *filter = false;
+    }
+
+    if arg == "--" && *filter {
+        // The typical shell style separator of parameters vs. input
+        *filter = false;
+    } else if arg.starts_with('@') && *filter {
         let context = arg.trim_start_matches('@');
         conf.flt.include.contexts.push(context.to_owned().to_lowercase());
-    } else if arg.starts_with("-@") && !has_space {
+    } else if arg.starts_with("-@") && *filter {
         let context = arg.trim_start_matches("-@");
         conf.flt.exclude.contexts.push(context.to_owned().to_lowercase());
-    } else if arg.starts_with('+') && !has_space {
+    } else if arg.starts_with('+') && *filter {
         let project = arg.trim_start_matches('+');
         conf.flt.include.projects.push(project.to_owned().to_lowercase());
-    } else if arg.starts_with("-+") && !has_space {
+    } else if arg.starts_with("-+") && *filter {
         let project = arg.trim_start_matches("-+");
         conf.flt.exclude.projects.push(project.to_owned().to_lowercase());
     } else if edit_mode {
+        // This one and all the following arguments are part of task description.
+        *filter = false;
         let dt = Local::now().date_naive();
         let subj = match human_date::fix_date(dt, arg, "due:", soon_days) {
             None => raw_arg.to_string(),
@@ -1634,5 +1652,105 @@ mod tests {
             assert_eq!(b, test.res[0], "{}. '{}' != '{}'", idx, b, test.res[0]);
             assert_eq!(e, test.res[1], "{}. '{}' != '{}'", idx, e, test.res[1]);
         }
+    }
+
+    #[test]
+    fn test_context_filter_from_desc_separation_explicit() {
+        let mut conf = Conf::new();
+        conf.mode = RunMode::Add;
+        let mut filter = true;
+        process_single_free_arg(&mut conf, 3, true, &mut filter, "@first");
+        assert_eq!(filter, true, "Filter list should have not been completed yet.");
+        assert_eq!(conf.todo.subject, None, "No subject provided.");
+        assert_eq!(conf.flt.include.contexts, vec!["first".to_string()]);
+
+        process_single_free_arg(&mut conf, 3, true, &mut filter, "--");
+        assert_eq!(filter, false, "Filter list should have been completed.");
+        assert_eq!(conf.todo.subject, None, "No subject provided.");
+
+        process_single_free_arg(&mut conf, 3, true, &mut filter, "@second");
+        assert_eq!(filter, false, "Filter list should have been completed.");
+        assert_eq!(conf.todo.subject, Some("@second".to_string()));
+        assert_eq!(conf.flt.include.contexts, vec!["first".to_string()]);
+
+        process_single_free_arg(&mut conf, 3, true, &mut filter, "@third");
+        assert_eq!(filter, false, "Filter list should have been completed.");
+        assert_eq!(conf.todo.subject, Some("@second @third".to_string()));
+        assert_eq!(conf.flt.include.contexts, vec!["first".to_string()]);
+    }
+
+    #[test]
+    fn test_context_filter_from_desc_separation_implicit() {
+        let mut conf = Conf::new();
+        conf.mode = RunMode::Add;
+        let mut filter = true;
+        process_single_free_arg(&mut conf, 3, true, &mut filter, "@first");
+        assert_eq!(filter, true, "Filter list should have not been completed yet.");
+        assert_eq!(conf.todo.subject, None, "No subject provided.");
+        assert_eq!(conf.flt.include.contexts, vec!["first".to_string()]);
+
+        process_single_free_arg(&mut conf, 3, true, &mut filter, "leader");
+        assert_eq!(filter, false, "Filter list should have been completed.");
+        assert_eq!(conf.todo.subject, Some("leader".to_string()));
+
+        process_single_free_arg(&mut conf, 3, true, &mut filter, "@second");
+        assert_eq!(filter, false, "Filter list should have been completed.");
+        assert_eq!(conf.todo.subject, Some("leader @second".to_string()));
+        assert_eq!(conf.flt.include.contexts, vec!["first".to_string()]);
+
+        process_single_free_arg(&mut conf, 3, true, &mut filter, "@third");
+        assert_eq!(filter, false, "Filter list should have been completed.");
+        assert_eq!(conf.todo.subject, Some("leader @second @third".to_string()));
+        assert_eq!(conf.flt.include.contexts, vec!["first".to_string()]);
+    }
+
+    #[test]
+    fn test_project_filter_from_desc_separation_explicit() {
+        let mut conf = Conf::new();
+        conf.mode = RunMode::Add;
+        let mut filter = true;
+        process_single_free_arg(&mut conf, 3, true, &mut filter, "+first");
+        assert_eq!(filter, true, "Filter list should have not been completed yet.");
+        assert_eq!(conf.todo.subject, None, "No subject provided.");
+        assert_eq!(conf.flt.include.projects, vec!["first".to_string()]);
+
+        process_single_free_arg(&mut conf, 3, true, &mut filter, "--");
+        assert_eq!(filter, false, "Filter list should have been completed.");
+        assert_eq!(conf.todo.subject, None, "No subject provided.");
+
+        process_single_free_arg(&mut conf, 3, true, &mut filter, "+second");
+        assert_eq!(filter, false, "Filter list should have been completed.");
+        assert_eq!(conf.todo.subject, Some("+second".to_string()));
+        assert_eq!(conf.flt.include.projects, vec!["first".to_string()]);
+
+        process_single_free_arg(&mut conf, 3, true, &mut filter, "+third");
+        assert_eq!(filter, false, "Filter list should have been completed.");
+        assert_eq!(conf.todo.subject, Some("+second +third".to_string()));
+        assert_eq!(conf.flt.include.projects, vec!["first".to_string()]);
+    }
+
+    #[test]
+    fn test_project_filter_from_desc_separation_implicit() {
+        let mut conf = Conf::new();
+        conf.mode = RunMode::Add;
+        let mut filter = true;
+        process_single_free_arg(&mut conf, 3, true, &mut filter, "+first");
+        assert_eq!(filter, true, "Filter list should have not been completed yet.");
+        assert_eq!(conf.todo.subject, None, "No subject provided.");
+        assert_eq!(conf.flt.include.projects, vec!["first".to_string()]);
+
+        process_single_free_arg(&mut conf, 3, true, &mut filter, "leader");
+        assert_eq!(filter, false, "Filter list should have been completed.");
+        assert_eq!(conf.todo.subject, Some("leader".to_string()));
+
+        process_single_free_arg(&mut conf, 3, true, &mut filter, "+second");
+        assert_eq!(filter, false, "Filter list should have been completed.");
+        assert_eq!(conf.todo.subject, Some("leader +second".to_string()));
+        assert_eq!(conf.flt.include.projects, vec!["first".to_string()]);
+
+        process_single_free_arg(&mut conf, 3, true, &mut filter, "+third");
+        assert_eq!(filter, false, "Filter list should have been completed.");
+        assert_eq!(conf.todo.subject, Some("leader +second +third".to_string()));
+        assert_eq!(conf.flt.include.projects, vec!["first".to_string()]);
     }
 }
